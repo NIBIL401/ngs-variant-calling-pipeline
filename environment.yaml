@@ -1,0 +1,13 @@
+# All tools in one environment (alternative to --use-conda per-rule environments)
+name: ngs-variant-calling
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python>=3.10
+  - snakemake>=8
+  - bwa
+  - samtools>=1.17
+  - bcftools>=1.17
+  - fastp
+  - multiqc

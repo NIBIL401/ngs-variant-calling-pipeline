@@ -1,0 +1,17 @@
+# Sample sheet: tab-separated with columns sample, fq1, fq2
+samples: config/samples.tsv
+
+# Reference FASTA (bwa index and .fai are created next to it if missing)
+reference: resources/genome.fa
+
+outdir: results
+threads: 4
+
+fastp:
+  # e.g. "--detect_adapter_for_pe --cut_right --length_required 50"
+  extra: "--detect_adapter_for_pe --length_required 50"
+
+bcftools:
+  mpileup_extra: "--max-depth 500 --min-MQ 20 --min-BQ 20"
+  # Variants matching this expression are soft-filtered with FILTER=LowQual
+  filter_expression: "QUAL<20 || INFO/DP<10 || INFO/MQ<30"

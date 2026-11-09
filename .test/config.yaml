@@ -1,0 +1,9 @@
+samples: .test/data/samples.tsv
+reference: .test/data/ref.fa
+outdir: .test/results
+threads: 2
+fastp:
+  extra: "--length_required 50"
+bcftools:
+  mpileup_extra: "--max-depth 500"
+  filter_expression: "QUAL<20 || INFO/DP<10"

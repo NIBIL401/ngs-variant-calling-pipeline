@@ -1,0 +1,31 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yaml
+          cache-environment: true
+      - name: Simulate test data
+        run: python .test/simulate.py .test/data
+      - name: Dry run
+        run: snakemake -n --cores 2 --configfile .test/config.yaml
+      - name: Run pipeline on simulated data
+        run: snakemake --cores 2 --configfile .test/config.yaml --printshellcmds
+      - name: Check calls against planted variants
+        run: python .test/check_truth.py .test/data/truth.tsv .test/results/variants/all.filtered.vcf.gz 0.9
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            .test/results/qc/multiqc_report.html
+            .test/results/variants/
+            .test/results/logs/

@@ -1,0 +1,219 @@
+# Germline short-variant calling from paired-end Illumina reads.
+#
+#   FASTQ -> fastp (QC/trim) -> bwa mem -> samtools fixmate/sort/markdup
+#         -> bcftools mpileup/call (joint) -> bcftools filter -> stats -> MultiQC
+
+import csv
+import os
+
+configfile: "config/config.yaml"
+
+
+def load_samples(path):
+    samples = {}
+    with open(path) as fh:
+        for row in csv.DictReader(fh, delimiter="\t"):
+            name = row["sample"].strip()
+            if not name or name.startswith("#"):
+                continue
+            samples[name] = {"fq1": row["fq1"].strip(), "fq2": row["fq2"].strip()}
+    if not samples:
+        raise ValueError(f"no samples found in {path}")
+    return samples
+
+
+SAMPLES = load_samples(config["samples"])
+REF = config["reference"]
+OUT = config.get("outdir", "results")
+THREADS = config.get("threads", 4)
+
+wildcard_constraints:
+    sample="|".join(map(str, SAMPLES)),
+
+
+rule all:
+    input:
+        f"{OUT}/variants/all.filtered.vcf.gz",
+        f"{OUT}/variants/all.filtered.vcf.gz.tbi",
+        f"{OUT}/qc/multiqc_report.html",
+
+
+# ---------------------------------------------------------------- reference --
+rule bwa_index:
+    input:
+        REF,
+    output:
+        multiext(REF, ".amb", ".ann", ".bwt", ".pac", ".sa"),
+    log:
+        f"{OUT}/logs/bwa_index.log",
+    conda:
+        "envs/align.yaml"
+    shell:
+        "bwa index {input} 2> {log}"
+
+
+rule faidx:
+    input:
+        REF,
+    output:
+        f"{REF}.fai",
+    conda:
+        "envs/align.yaml"
+    shell:
+        "samtools faidx {input}"
+
+
+# ---------------------------------------------------------------------- QC --
+rule fastp:
+    input:
+        r1=lambda wc: SAMPLES[wc.sample]["fq1"],
+        r2=lambda wc: SAMPLES[wc.sample]["fq2"],
+    output:
+        r1=f"{OUT}/trimmed/{{sample}}_R1.fastq.gz",
+        r2=f"{OUT}/trimmed/{{sample}}_R2.fastq.gz",
+        html=f"{OUT}/qc/fastp/{{sample}}.html",
+        json=f"{OUT}/qc/fastp/{{sample}}.fastp.json",
+    params:
+        extra=config["fastp"].get("extra", ""),
+    log:
+        f"{OUT}/logs/fastp/{{sample}}.log",
+    threads: THREADS
+    conda:
+        "envs/qc.yaml"
+    shell:
+        "fastp -i {input.r1} -I {input.r2} -o {output.r1} -O {output.r2} "
+        "-h {output.html} -j {output.json} -w {threads} {params.extra} 2> {log}"
+
+
+# --------------------------------------------------------------- alignment --
+rule bwa_mem:
+    input:
+        r1=rules.fastp.output.r1,
+        r2=rules.fastp.output.r2,
+        idx=rules.bwa_index.output,
+    output:
+        temp(f"{OUT}/aligned/{{sample}}.sorted.bam"),
+    params:
+        ref=REF,
+        rg=lambda wc: f"@RG\\tID:{wc.sample}\\tSM:{wc.sample}\\tPL:ILLUMINA\\tLB:{wc.sample}",
+        tmp=lambda wc: f"{OUT}/aligned/{wc.sample}.tmp",
+    log:
+        f"{OUT}/logs/bwa_mem/{{sample}}.log",
+    threads: THREADS
+    conda:
+        "envs/align.yaml"
+    shell:
+        "(bwa mem -t {threads} -R '{params.rg}' {params.ref} {input.r1} {input.r2} "
+        " | samtools fixmate -m - - "
+        " | samtools sort -@ {threads} -T {params.tmp} -o {output} -) 2> {log}"
+
+
+rule markdup:
+    input:
+        rules.bwa_mem.output,
+    output:
+        bam=f"{OUT}/aligned/{{sample}}.markdup.bam",
+        stats=f"{OUT}/qc/markdup/{{sample}}.markdup.txt",
+    log:
+        f"{OUT}/logs/markdup/{{sample}}.log",
+    threads: THREADS
+    conda:
+        "envs/align.yaml"
+    shell:
+        "samtools markdup -@ {threads} -s -f {output.stats} {input} {output.bam} 2> {log}"
+
+
+rule index_bam:
+    input:
+        "{prefix}.bam",
+    output:
+        "{prefix}.bam.bai",
+    conda:
+        "envs/align.yaml"
+    shell:
+        "samtools index {input}"
+
+
+rule bam_stats:
+    input:
+        bam=rules.markdup.output.bam,
+        bai=f"{OUT}/aligned/{{sample}}.markdup.bam.bai",
+    output:
+        flagstat=f"{OUT}/qc/samtools/{{sample}}.flagstat.txt",
+        stats=f"{OUT}/qc/samtools/{{sample}}.stats.txt",
+    conda:
+        "envs/align.yaml"
+    shell:
+        "samtools flagstat {input.bam} > {output.flagstat} && "
+        "samtools stats {input.bam} > {output.stats}"
+
+
+# --------------------------------------------------------- variant calling --
+rule call_variants:
+    input:
+        bams=expand(f"{OUT}/aligned/{{sample}}.markdup.bam", sample=SAMPLES),
+        bais=expand(f"{OUT}/aligned/{{sample}}.markdup.bam.bai", sample=SAMPLES),
+        ref=REF,
+        fai=f"{REF}.fai",
+    output:
+        f"{OUT}/variants/all.raw.vcf.gz",
+    params:
+        mpileup=config["bcftools"].get("mpileup_extra", ""),
+    log:
+        f"{OUT}/logs/bcftools_call.log",
+    threads: THREADS
+    conda:
+        "envs/variants.yaml"
+    shell:
+        "(bcftools mpileup --threads {threads} -f {input.ref} -a FORMAT/AD,FORMAT/DP {params.mpileup} -Ou {input.bams} "
+        " | bcftools call --threads {threads} -mv -Oz -o {output}) 2> {log}"
+
+
+rule filter_variants:
+    input:
+        rules.call_variants.output,
+    output:
+        vcf=f"{OUT}/variants/all.filtered.vcf.gz",
+        tbi=f"{OUT}/variants/all.filtered.vcf.gz.tbi",
+    params:
+        expr=config["bcftools"]["filter_expression"],
+    log:
+        f"{OUT}/logs/bcftools_filter.log",
+    conda:
+        "envs/variants.yaml"
+    shell:
+        "(bcftools filter -s LowQual -e '{params.expr}' -Oz -o {output.vcf} {input} "
+        " && bcftools index -t {output.vcf}) 2> {log}"
+
+
+rule variant_stats:
+    input:
+        vcf=rules.filter_variants.output.vcf,
+        ref=REF,
+    output:
+        f"{OUT}/qc/bcftools/all.filtered.stats.txt",
+    conda:
+        "envs/variants.yaml"
+    shell:
+        "bcftools stats -F {input.ref} -s - {input.vcf} > {output}"
+
+
+# ------------------------------------------------------------------ report --
+rule multiqc:
+    input:
+        expand(f"{OUT}/qc/fastp/{{sample}}.fastp.json", sample=SAMPLES),
+        expand(f"{OUT}/qc/samtools/{{sample}}.flagstat.txt", sample=SAMPLES),
+        expand(f"{OUT}/qc/samtools/{{sample}}.stats.txt", sample=SAMPLES),
+        expand(f"{OUT}/qc/markdup/{{sample}}.markdup.txt", sample=SAMPLES),
+        f"{OUT}/qc/bcftools/all.filtered.stats.txt",
+    output:
+        f"{OUT}/qc/multiqc_report.html",
+    params:
+        indir=f"{OUT}/qc",
+        outdir=lambda wc, output: os.path.dirname(output[0]),
+    log:
+        f"{OUT}/logs/multiqc.log",
+    conda:
+        "envs/qc.yaml"
+    shell:
+        "multiqc -f -o {params.outdir} -n multiqc_report.html {params.indir} 2> {log}"
