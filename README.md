@@ -51,7 +51,7 @@ truth SNPs:            30
 PASS SNP calls:        30
 recall:                1.000
 precision:             1.000
-genotype concordance:  ...
+genotype concordance:  1.000
 OK
 ```
 
